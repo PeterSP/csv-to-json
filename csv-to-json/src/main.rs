@@ -1,14 +1,53 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_stream::try_stream;
 use bytes::Bytes;
 use clap::Parser;
 use futures::{pin_mut, Stream, TryStreamExt};
+use hyper::header::{CONTENT_DISPOSITION, CONTENT_TYPE};
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use multer::Multipart;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::str::FromStr;
+
+fn replace_file_extension(path: &str, extension: &str) -> Result<String> {
+    let mut path = PathBuf::from_str(path)?;
+    path.set_extension(extension);
+    let path = path
+        .to_str()
+        .ok_or_else(|| anyhow!("unable to convert path to String"))?;
+    Ok(path.to_string())
+}
+
+/// Stream producer that takes a request body and attempts to read the first multipart/form-data
+/// field that it encounters.
+async fn read_multipart(
+    body: Body,
+    boundary: String,
+) -> Option<(String, impl Stream<Item = multer::Result<Bytes>>)> {
+    // FIXME: possible DOS attack vector by attempting to read the whole multipart/form-data field. multer provides
+    //        a constraints API to help mitigate this risk: https://github.com/rousan/multer-rs.
+    let mut multipart = Multipart::new(body, boundary);
+    // KLUDGE: a result type with an error we can match on might be better here, that way we can differentiate
+    //         between "don't have a multiple field when we were expecting one" and "there was an error reading
+    //         the multipart field".
+    let mut field = multipart.next_field().await.ok()??;
+    // FIXME: possible attack vectors here by passing through the file name from the multipart POST request. may
+    //        want to do some sanitizing.
+    let file_name = field.file_name().unwrap_or("download.csv");
+    Some((
+        file_name.to_string(),
+        try_stream! {
+            while let Some(chunk) = field.chunk().await? {
+                yield chunk;
+            }
+        },
+    ))
+}
 
 const fn default_delimiter() -> char {
     ','
@@ -45,11 +84,12 @@ fn parse_csv_records<S, B>(
     input: S,
 ) -> impl Stream<Item = csv_async::Result<CsvRecord>>
 where
-    S: Stream<Item = std::io::Result<B>> + Unpin + Send,
+    S: Stream<Item = std::io::Result<B>> + Send,
     B: AsRef<[u8]> + Send,
 {
     let CsvParseOptions { delimiter, quote } = options;
     try_stream! {
+        pin_mut!(input);
         let deserializer = csv_async::AsyncReaderBuilder::new()
             .delimiter(delimiter as u8)
             .quote(quote as u8)
@@ -111,9 +151,36 @@ async fn convert_csv(req: Request<Body>) -> Result<Response<Body>, hyper::http::
         }
     };
 
+    let boundary = req
+        .headers()
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|ct| ct.to_str().ok())
+        .and_then(|ct| multer::parse_boundary(ct).ok());
+    let boundary = match boundary {
+        Some(boundary) => boundary,
+        None => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(
+                    r#"{"error":"missing boundary in multipart content type"}"#,
+                ))
+                .unwrap())
+        }
+    };
+    let (file_name, csv_file) = match read_multipart(req.into_body(), boundary).await {
+        Some(res) => res,
+        None => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(
+                    r#"{"error":"missing required multipart file field"}"#,
+                ))
+                .unwrap())
+        }
+    };
     let csv_records = parse_csv_records(
         csv_parse_options,
-        req.into_body()
+        csv_file
             // KLUDGE: csv_async currently requires errors to be std::io::Error since it assumes it's reading from
             //         an io device directly. We're just mapping all errors as std::io::ErrorKind::Other for now, but
             //         we could be more finely detailed if it turns out csv_async handles some std::io::Error variants
@@ -125,12 +192,26 @@ async fn convert_csv(req: Request<Body>) -> Result<Response<Body>, hyper::http::
         //       with requests.
         eprintln!("error during CSV conversion: {:?}", error);
     });
+    let download_file_name = replace_file_extension(&file_name, "json")
+        .ok()
+        .unwrap_or("download.csv".to_string());
     Response::builder()
-        .header("content-type", "application/json")
+        // NOTE: according to https://github.com/eligrey/FileSaver.js/wiki/Saving-a-remote-file it is better to
+        //       use octent-stream over the actual mime type when trying to stream data so that browsers don't
+        //       try to render the result, but instead force a file-save dialog.
+        .header(CONTENT_TYPE, "application/octet-stream; charset=utf-8")
+        .header(
+            CONTENT_DISPOSITION,
+            format!(
+                r#"attachment; filename="{0}"; filename*="{0}""#,
+                download_file_name
+            ),
+        )
         .body(Body::wrap_stream(response))
 }
 
 async fn route_request(req: Request<Body>) -> Result<Response<Body>, hyper::http::Error> {
+    println!("got request: {:?}", &req);
     match (req.method(), req.uri().path()) {
         (&Method::POST, "/") => convert_csv(req).await,
         _ => Response::builder()
@@ -142,7 +223,7 @@ async fn route_request(req: Request<Body>) -> Result<Response<Body>, hyper::http
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    #[clap(short, long, default_value_t = 3000)]
+    #[clap(short, long, default_value_t = 8000)]
     port: u16,
 }
 
@@ -167,7 +248,26 @@ async fn main() {
 mod tests {
     use super::*;
     use futures::TryStreamExt;
+    use hyper::header::HeaderValue;
     use pretty_assertions::assert_eq;
+
+    const BOUNDARY: &str = "X-BOUNDARY";
+
+    fn build_multipart_request(
+        request: hyper::http::request::Builder,
+        data: &str,
+    ) -> Request<Body> {
+        request
+            .header(
+                CONTENT_TYPE,
+                format!("multipart/form-data; boundary={}", BOUNDARY),
+            )
+            .body(Body::from(format!(
+                "--{0}\r\nContent-Disposition: form-data; name=\"field\"; filename=\"example.csv\"\r\n\r\n{1}\r\n--{0}\r\n",
+                BOUNDARY, data
+            )))
+            .unwrap()
+    }
 
     async fn read_to_string(body: Body) -> String {
         body.try_fold(String::new(), |output, bytes| async move {
@@ -180,7 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_csv() -> Result<()> {
-        let req = Request::builder().body(Body::empty())?;
+        let req = build_multipart_request(Request::builder(), "");
         let res = convert_csv(req).await?;
         assert_eq!(res.status(), StatusCode::OK);
         let res_body = read_to_string(res.into_body()).await;
@@ -190,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_nothing_when_only_headers() -> Result<()> {
-        let req = Request::builder().body(Body::from("field1,field2,field3"))?;
+        let req = build_multipart_request(Request::builder(), "field1,field2,field3");
         let res = convert_csv(req).await?;
         assert_eq!(res.status(), StatusCode::OK);
         let res_body = read_to_string(res.into_body()).await;
@@ -200,7 +300,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_single_record_for_single_line() -> Result<()> {
-        let req = Request::builder().body(Body::from("field1,field2,field3\n1,2,3"))?;
+        let req = build_multipart_request(Request::builder(), "field1,field2,field3\n1,2,3");
         let res = convert_csv(req).await?;
         assert_eq!(res.status(), StatusCode::OK);
         let res_body = read_to_string(res.into_body()).await;
@@ -210,7 +310,7 @@ mod tests {
 
     #[tokio::test]
     async fn returns_multiple_records_for_multiple_lines() -> Result<()> {
-        let req = Request::builder().body(Body::from("field1,field2,field3\n1,2,3\n4,5,6"))?;
+        let req = build_multipart_request(Request::builder(), "field1,field2,field3\n1,2,3\n4,5,6");
         let res = convert_csv(req).await?;
         assert_eq!(res.status(), StatusCode::OK);
         let res_body = read_to_string(res.into_body()).await;
@@ -223,7 +323,8 @@ mod tests {
 
     #[tokio::test]
     async fn can_parse_quoted_fields() -> Result<()> {
-        let req = Request::builder().body(Body::from("\"field1\",field2,field3\n1,\"2\",3"))?;
+        let req =
+            build_multipart_request(Request::builder(), "\"field1\",field2,field3\n1,\"2\",3");
         let res = convert_csv(req).await?;
         assert_eq!(res.status(), StatusCode::OK);
         let res_body = read_to_string(res.into_body()).await;
@@ -233,8 +334,10 @@ mod tests {
 
     #[tokio::test]
     async fn can_parse_newslines_in_quoted_fields() -> Result<()> {
-        let req =
-            Request::builder().body(Body::from("\"field1\",field2,field3\n1,\"2 &\n 3\",4"))?;
+        let req = build_multipart_request(
+            Request::builder(),
+            "\"field1\",field2,field3\n1,\"2 &\n 3\",4",
+        );
         let res = convert_csv(req).await?;
         assert_eq!(res.status(), StatusCode::OK);
         let res_body = read_to_string(res.into_body()).await;
@@ -248,9 +351,10 @@ mod tests {
     #[tokio::test]
 
     async fn can_change_delimiter_with_query_param() -> Result<()> {
-        let req = Request::builder()
-            .uri("/?delimiter=%09")
-            .body(Body::from("field1\tfield2\tfield3\n1\t2\t3"))?;
+        let req = build_multipart_request(
+            Request::builder().uri("/?delimiter=%09"),
+            "field1\tfield2\tfield3\n1\t2\t3",
+        );
         let res = convert_csv(req).await?;
         assert_eq!(res.status(), StatusCode::OK);
         let res_body = read_to_string(res.into_body()).await;
@@ -261,13 +365,29 @@ mod tests {
     #[tokio::test]
 
     async fn can_change_quote_char_with_query_param() -> Result<()> {
-        let req = Request::builder()
-            .uri("/?quote=%27")
-            .body(Body::from("field1,'field2','field3'\n1,'2',3"))?;
+        let req = build_multipart_request(
+            Request::builder().uri("/?quote=%27"),
+            "field1,'field2','field3'\n1,'2',3",
+        );
         let res = convert_csv(req).await?;
         assert_eq!(res.status(), StatusCode::OK);
         let res_body = read_to_string(res.into_body()).await;
         assert_eq!(&res_body, r#"[{"field1":"1","field2":"2","field3":"3"}]"#);
+        Ok(())
+    }
+
+    #[tokio::test]
+
+    async fn responds_with_content_disposition_header() -> Result<()> {
+        let req = build_multipart_request(Request::builder(), "field1,field2,field3\n1,2,3");
+        let res = convert_csv(req).await?;
+
+        assert_eq!(
+            res.headers().get("content-disposition"),
+            Some(&HeaderValue::from_static(
+                r#"attachment; filename="example.json"; filename*="example.json""#
+            ))
+        );
         Ok(())
     }
 }
