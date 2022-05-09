@@ -1,0 +1,25 @@
+{
+    "extends": "../tsconfig.base.json",
+    "compilerOptions": {
+        "useDefineForClassFields": true,
+        "target": "ESNext",
+        "lib": ["DOM", "DOM.Iterable", "ESNext"],
+        "allowJs": false,
+        "skipLibCheck": true,
+        "esModuleInterop": false,
+        "allowSyntheticDefaultImports": true,
+        "module": "ESNext",
+        "moduleResolution": "Node",
+        "isolatedModules": true,
+        "jsx": "react-jsx",
+        "jsxImportSource": "preact",
+        "rootDir": "./",
+        "types": ["vite/client"],
+        "typeRoots": ["./types"],
+        "paths": {
+            "#/*": ["./*"],
+            "react": ["../node_modules/preact/compat"],
+            "react-dom": ["../node_modules/preact/compat"]
+        }
+    }
+}
