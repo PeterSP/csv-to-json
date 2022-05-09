@@ -25,7 +25,7 @@ $> csv-to-json
 listening on 127.0.0.1:8000
 ```
 
-To parse a csv into JSON, simply make a multipart/form-data POST request to the root path where the server is listening (all other request types and paths will return a 404 NOT FOUND response).
+To parse a csv into JSON, simply make a multipart/form-data POST request to the root path where the server is listening (all other request types and paths will return a 404 NOT FOUND response). Include a file field in the multipart request that contains the encoded CSV data. You can name this multipart field anything you like, the service will just take the first field that it finds from the multipart request. The field name "file" is used in all examples.
 
 For example, given a CSV file `fakebirds.csv` containing the following records:
 
